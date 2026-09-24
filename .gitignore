@@ -1,0 +1,11 @@
+results/
+destination_log.txt
+goodput_samples.csv
+summary_table.csv
+goodput_plot.png
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pcap
+.idea/

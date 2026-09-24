@@ -1,0 +1,7 @@
+results/
+.git/
+__pycache__/
+*.pyc
+venv/
+.venv/
+*.pcap
