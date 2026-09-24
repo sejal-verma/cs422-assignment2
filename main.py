@@ -1,4 +1,4 @@
-"""CS 422 Assignment 2 -- Part 1: iPerf Throughput Application.
+"""CS 422 Assignment 2 -- Parts 1 & 2: iPerf Throughput & TCP Statistics Tracing.
 See README.md for usage, the iperf3 protocol flow, and output files.
 """
 
@@ -57,12 +57,12 @@ IO_TIMEOUT = 10.0              # seconds to wait for a control-channel read
 
 
 # ==============================================================================
-# Part 1(c): reading TCP statistics from the data socket
+# Part 1(c) & Part 2(a): reading TCP statistics from the data socket
 # ==============================================================================
 class _TCPInfoPrefix(ctypes.Structure):
-    """Leading fields of Linux's `struct tcp_info`.
+    """Leading and extended fields of Linux's `struct tcp_info`.
 
-    We only declare fields up to `tcpi_bytes_acked`, which is all Part 1 needs.
+    Includes the fields needed for goodput and Part 2 TCP statistics.
     ctypes applies the same natural alignment as the kernel's C struct, so
     tcpi_bytes_acked ends up at byte offset 120 without manual offset math.
     (Field order must match the kernel header exactly.)
@@ -187,15 +187,24 @@ def recv_json(sock: socket.socket) -> dict:
 
 
 # ==============================================================================
-# Data containers
+# Data containers (Parts 1 & 2)
 # ==============================================================================
 @dataclass
 class GoodputSample:
-    """One goodput measurement for a single sampling interval."""
+    """One periodic sample containing goodput and low-level TCP statistics."""
     elapsed_s: float       # seconds since the send loop started
     bytes_acked: int       # cumulative ACKed bytes at this instant (from TCP_INFO)
     goodput_bps: float     # (delta bytes acked) * 8 / (delta time), bits per second
-
+    destination: str = ""
+    algorithm: str = "unknown"
+    run_id: str = ""
+    snd_cwnd: int = 0
+    rtt_us: float = 0.0
+    rtt_ms: float = 0.0
+    rttvar_us: int = 0
+    total_retrans: int = 0
+    lost: int = 0
+    pacing_rate_bps: int = 0
 
 @dataclass
 class TestResult:
@@ -279,6 +288,9 @@ class Iperf3Client:
         block) can't delay or skip samples.
         """
         result.algorithm = get_congestion_algorithm(self.data_sock)
+        sampler = getattr(self.on_sample, "__self__", None)
+        if sampler is not None and hasattr(sampler, "set_algorithm"):
+            sampler.set_algorithm(result.algorithm)
         buf = bytes(self.blksize)               # payload: a block of zero bytes
         start = time.monotonic()                # monotonic clock: immune to clock changes
         deadline = start + self.duration
@@ -483,7 +495,12 @@ def select_destinations(n: int, duration: float, max_extra_attempts: int):
         print(f"[{attempts_used}/{max_total_attempts}] Testing {host}:{port} ...")
 
         # A fresh sampler per destination keeps each server's samples separate.
-        sampler = GoodputSampler()
+        destination_str = f"{host}:{port}"
+        sampler = TCPStatsSampler(
+            destination=destination_str,
+            algorithm="unknown",
+            run_id=f"run_{attempts_used}",
+        )
         client = Iperf3Client(host, port, duration=duration, on_sample=sampler.on_sample)
         result = client.run()
         result.samples = sampler.samples
@@ -518,10 +535,10 @@ def select_destinations(n: int, duration: float, max_extra_attempts: int):
 
 
 # ==============================================================================
-# Part 1(c): goodput sampling, plotting, summary table
+# Part 1(c) & Part 2(a): TCP stats sampling, plotting, summary table
 # ==============================================================================
-class GoodputSampler:
-    """Turns periodic cumulative-ACK counters into goodput samples.
+class TCPStatsSampler:
+    """Capture TCP_INFO metrics and calculate interval goodput samples.
 
     goodput(t) = (bytes_acked_now - bytes_acked_previous) * 8 / (t_now - t_previous)
 
@@ -529,28 +546,116 @@ class GoodputSampler:
     data still sitting in the send buffer or lost in flight.
     """
 
-    def __init__(self):
+    def __init__(self, destination: str, algorithm: str = "unknown", run_id: str = "run_1"):
+        self.destination = destination
+        self.algorithm = algorithm
+        self.run_id = run_id
         self.samples: list[GoodputSample] = []
         self._last_time: Optional[float] = None    # time of the previous reading
         self._last_bytes: Optional[int] = None     # bytes_acked at the previous reading
 
+    def set_algorithm(self, algorithm: str) -> None:
+        self.algorithm = algorithm
+
     def on_sample(self, data_sock: socket.socket, elapsed_s: float, _bytes_sent: int) -> None:
         """Callback given to Iperf3Client; called once per sampling tick."""
-        acked = get_bytes_acked(data_sock)
-        if acked is None:
+        try:
+            raw = data_sock.getsockopt(
+                socket.IPPROTO_TCP,
+                _TCP_INFO_OPT,
+                ctypes.sizeof(_TCPInfoPrefix),
+            )
+            if len(raw) < ctypes.sizeof(_TCPInfoPrefix):
+                return
+            info = _TCPInfoPrefix.from_buffer_copy(raw)
+        except (OSError, AttributeError):
             return  # TCP_INFO unavailable (not Linux); nothing to record
 
-        # The first call only records a baseline; a rate needs two readings.
+        acked = info.tcpi_bytes_acked
+        goodput_bps = 0.0
+
         if self._last_time is not None:
             dt = elapsed_s - self._last_time
             if dt < SAMPLE_INTERVAL / 2:
                 return  # too short an interval; would give a noisy goodput value
             dbytes = acked - self._last_bytes
             goodput_bps = (dbytes * 8 / dt) if dt > 0 else 0.0   # bytes -> bits
-            self.samples.append(GoodputSample(elapsed_s, acked, goodput_bps))
+
+        self.samples.append(GoodputSample(
+            elapsed_s=round(elapsed_s, 3),
+            bytes_acked=acked,
+            goodput_bps=round(goodput_bps, 2),
+            destination=self.destination,
+            algorithm=self.algorithm,
+            run_id=self.run_id,
+            snd_cwnd=info.tcpi_snd_cwnd,
+            rtt_us=float(info.tcpi_rtt),
+            rtt_ms=round(info.tcpi_rtt / 1000.0, 3),
+            rttvar_us=info.tcpi_rttvar,
+            total_retrans=info.tcpi_total_retrans,
+            lost=info.tcpi_lost,
+            pacing_rate_bps=info.tcpi_pacing_rate,
+        ))
 
         self._last_time = elapsed_s
         self._last_bytes = acked
+
+
+def save_tcp_stats_export(
+    results: list[TestResult],
+    csv_path: Path,
+    json_metadata_path: Path,
+) -> None:
+    """Write the detailed TCP statistics trace and its metric documentation."""
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(
+            "destination,run_id,algorithm,elapsed_s,goodput_bps,snd_cwnd,"
+            "rtt_us,rtt_ms,rttvar_us,total_retrans,lost,pacing_rate_bps,bytes_acked\n"
+        )
+        for result in results:
+            for sample in result.samples:
+                f.write(
+                    f"{sample.destination},{sample.run_id},{sample.algorithm},"
+                    f"{sample.elapsed_s:.3f},{sample.goodput_bps:.1f},"
+                    f"{sample.snd_cwnd},{sample.rtt_us:.1f},{sample.rtt_ms:.3f},"
+                    f"{sample.rttvar_us},{sample.total_retrans},{sample.lost},"
+                    f"{sample.pacing_rate_bps},{sample.bytes_acked}\n"
+                )
+    print(f"Detailed TCP stats CSV written to {csv_path}")
+
+    metadata = {
+        "description": "Part 2(a) TCP Statistics & Goodput Export",
+        "kernel_decoding": (
+            "Extracted via getsockopt(IPPROTO_TCP, TCP_INFO, struct tcp_info) "
+            "using a ctypes prefix mapping."
+        ),
+        "metrics": {
+            "elapsed_s": {
+                "unit": "seconds",
+                "description": "Time elapsed since send loop start via monotonic clock.",
+            },
+            "goodput_bps": {
+                "unit": "bits/second",
+                "formula": "(delta bytes_acked * 8) / delta time",
+            },
+            "snd_cwnd": {"unit": "segments/packets", "field": "tcpi_snd_cwnd"},
+            "rtt_us": {"unit": "microseconds", "field": "tcpi_rtt"},
+            "rtt_ms": {"unit": "milliseconds", "formula": "rtt_us / 1000.0"},
+            "rttvar_us": {"unit": "microseconds", "field": "tcpi_rttvar"},
+            "total_retrans": {
+                "unit": "packet count",
+                "field": "tcpi_total_retrans (Loss Signal)",
+            },
+            "lost": {"unit": "packet count", "field": "tcpi_lost (Loss Proxy)"},
+            "pacing_rate_bps": {
+                "unit": "bytes/second",
+                "field": "tcpi_pacing_rate",
+            },
+            "bytes_acked": {"unit": "bytes", "field": "tcpi_bytes_acked"},
+        },
+    }
+    json_metadata_path.write_text(json.dumps(metadata, indent=4), encoding="utf-8")
+    print(f"TCP stats metadata documentation written to {json_metadata_path}")
 
 
 def build_summary_table(results: list[TestResult]):
@@ -676,13 +781,18 @@ def main():
 
     # 1(c): save every raw goodput sample ("compute and record").
     samples_path = RESULTS_DIR / "goodput_samples.csv"
-    with open(samples_path, "w") as f:
+    with open(samples_path, "w", encoding="utf-8") as f:
         f.write("destination,elapsed_s,bytes_acked,goodput_bps\n")
         for r in results:
             for s in r.samples:
                 f.write(f"{r.host}:{r.port},{s.elapsed_s:.3f},{s.bytes_acked},{s.goodput_bps:.1f}\n")
     print(f"Raw samples written to {samples_path}")
 
+    save_tcp_stats_export(
+        results,
+        RESULTS_DIR / "tcp_stats_trace.csv",
+        RESULTS_DIR / "tcp_stats_metadata.json",
+    )
     # 1(c): summary table (min / median / mean / p95 per destination).
     summary = build_summary_table(results)
     print("\nSummary (Mbps):")
