@@ -1,15 +1,36 @@
 """CS 422 Assignment 2 -- Parts 1 & 2: iPerf Throughput & TCP Statistics Tracing.
 See README.md for usage, the iperf3 protocol flow, and output files.
+"""CS 422 Assignment 2 -- Part 1: iPerf Throughput Application.
+
+See README.md for usage, the iperf3 protocol flow, and the output files.
+
+Everything that touches the network uses only Python's standard library:
+  socket   plain TCP sockets, getsockopt() for TCP statistics
+  struct   packing/unpacking protocol bytes
+  json     the iperf3 JSON messages
+  ctypes   decoding the kernel's struct tcp_info returned by getsockopt()
+  urllib   downloading the public server list
+No iperf3 binary, no iperf3 library, and no custom receiver are used.
+The only third-party package is matplotlib, used just to draw the plot.
+
+Layout of this file (search for the banners below)
+  Configuration
+  PART 1(a)  iperf3 client written from scratch with plain sockets
+  PART 1(b)  destination selection, failure logging, bounded replacement
+  PART 1(c)  goodput from TCP_INFO, summary table, plot
+  Launcher   optional Docker hand-off, then the entry point
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
 import json
 import os
 import random
 import socket
+import statistics
 import string
 import struct
 import subprocess
@@ -20,22 +41,40 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-# ==============================================================================
-# Run configuration (defaults; most can be overridden on the command line)
-# ==============================================================================
-N_DESTINATIONS = 10            # how many successful destinations we want (--n)
-DURATION = 10.0                # seconds of sending per destination (--duration)
-MAX_REPLACEMENT_ATTEMPTS = 30  # extra tries allowed when servers fail (--max-extra-attempts)
+
+# ##############################################################################
+# CONFIGURATION
+# Defaults used when no command-line option is given (see main() for the flags).
+# ##############################################################################
+N_DESTINATIONS = 10            # how many successful destinations we want  (--n)
+DURATION = 10.0                # seconds of sending per destination          (--duration)
+MAX_REPLACEMENT_ATTEMPTS = 30  # extra tries allowed when servers fail       (--max-extra-attempts)
 SAMPLE_INTERVAL = 0.2          # goodput sampling period in seconds (200 ms)
 
-# Official JSON export of iperf3serverlist.net (the website table itself is
-# rendered by JavaScript, so it can't be scraped with a plain HTTP request).
+# Official JSON export of iperf3serverlist.net. The website's own table is
+# rendered by JavaScript, so it can't be read with a plain HTTP request.
 SERVER_LIST_URL = "https://export.iperf3serverlist.net/listed_iperf3_servers.json"
-RESULTS_DIR = Path(".")        # output files go in the project folder
+RESULTS_DIR = Path(".")        # output files are written to the project folder
 
-# ==============================================================================
-# iperf3 protocol constants
-# ==============================================================================
+
+# ##############################################################################
+# PART 1(a)  |  Write a socket program from scratch: the iperf3 client
+#
+# Requirements covered here:
+#   (i)   establish the control connection
+#   (ii)  JSON-based parameter exchange
+#   (iii) open the data connection
+#   (iv)  transmit data continuously for a configurable duration
+#   (v)   terminate the test following iperf3 semantics
+#   plus robust handling of unresponsive servers, rejected parameters,
+#   connection timeouts, and premature connection termination.
+#
+# Only plain TCP sockets are used. The only socket setting we change is the
+# timeout, so buffers, Nagle, and the congestion control algorithm all stay at
+# the operating system defaults.
+# ##############################################################################
+
+# ---- 1(a).1  Protocol constants ----------------------------------------------
 COOKIE_SIZE = 37               # iperf3 cookie: 36 random chars + NUL terminator
 
 # Single-byte "state" values sent over the control connection.
@@ -217,12 +256,10 @@ class TestResult:
     duration_actual: float = 0.0             # real length of the send loop (s)
     algorithm: str = "unknown"               # TCP congestion control actually used
     server_results: Optional[dict] = None    # results JSON sent back by the server
-    samples: list = field(default_factory=list)  # list[GoodputSample]
+    samples: list = field(default_factory=list)  # goodput samples, see 1(c).2
 
 
-# ==============================================================================
-# Part 1(a): the iperf3 client
-# ==============================================================================
+# ---- 1(a).4  The client ------------------------------------------------------
 class Iperf3Client:
     """A minimal iperf3 client: one TCP stream, client -> server direction."""
 
@@ -374,7 +411,7 @@ class Iperf3Client:
                     pass  # nothing to do; wait for TEST_RUNNING
                 elif state == TEST_RUNNING:
                     self._run_send_loop(result)
-                    # Client is the one that ends the test; the server waits for this.
+                    # Step (v): the client is the one that ends the test.
                     self.ctrl_sock.sendall(struct.pack("b", TEST_END))
                 elif state == EXCHANGE_RESULTS:
                     self._send_results(result)
@@ -385,6 +422,7 @@ class Iperf3Client:
                     result.success = True
                     break
                 elif state == ACCESS_DENIED:
+                    # Server busy or rejected our parameters.
                     raise ConnectionError("server sent ACCESS_DENIED (busy or rejected params)")
                 elif state == SERVER_ERROR:
                     i_errno, _errno = struct.unpack("!ii", recv_exact(self.ctrl_sock, 8))
@@ -392,15 +430,15 @@ class Iperf3Client:
                 else:
                     raise ConnectionError(f"unrecognized state byte {state} -- verify with Wireshark")
 
-        # ---- robust error handling required by the assignment ----
+        # ---- robust error handling required by 1(a) ----
         except socket.timeout:
-            result.error = "timeout (server non-responsive)"
+            result.error = "timeout (server non-responsive)"        # unresponsive / connect timeout
         except ConnectionRefusedError:
             result.error = "connection refused"
         except (ConnectionResetError, BrokenPipeError) as e:
-            result.error = f"connection reset/broken pipe: {e}"
+            result.error = f"connection reset/broken pipe: {e}"     # premature termination
         except (ConnectionError, OSError) as e:
-            result.error = str(e)   # includes premature close, ACCESS_DENIED, etc.
+            result.error = str(e)   # includes premature close, ACCESS_DENIED, SERVER_ERROR, DNS errors
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             result.error = f"malformed JSON from server: {e}"
         finally:
@@ -415,9 +453,15 @@ class Iperf3Client:
         return result
 
 
-# ==============================================================================
-# Part 1(b): destination selection
-# ==============================================================================
+# ##############################################################################
+# PART 1(b)  |  Destination selection
+#
+# Requirements covered here:
+#   - pick n random servers from the public list (n set with --n, default 10)
+#   - record the selected server addresses and ports
+#   - log a failure and try a replacement, with a bounded number of attempts
+#   - report any shortfall against the requested n
+# ##############################################################################
 class _Redirect308(urllib.request.HTTPRedirectHandler):
     """Python < 3.11 does not follow HTTP 308 redirects; treat 308 like 301."""
     def http_error_308(self, req, fp, code, msg, headers):
@@ -575,10 +619,10 @@ class TCPStatsSampler:
         goodput_bps = 0.0
 
         if self._last_time is not None:
-            dt = elapsed_s - self._last_time
+            dt = elapsed_s - self._last_time            # actual elapsed sampling time
             if dt < SAMPLE_INTERVAL / 2:
                 return  # too short an interval; would give a noisy goodput value
-            dbytes = acked - self._last_bytes
+            dbytes = acked - self._last_bytes           # difference of cumulative counters
             goodput_bps = (dbytes * 8 / dt) if dt > 0 else 0.0   # bytes -> bits
 
         self.samples.append(GoodputSample(
@@ -662,27 +706,47 @@ def build_summary_table(results: list[TestResult]):
     """Build a per-destination table of min / median / mean / p95 goodput (Mbps).
 
     All samples are included, even zero-goodput ones: stalls are real behavior
-    and should pull the minimum and median down. The 95th percentile uses
-    pandas' default linear interpolation (same as numpy.percentile).
+    and should pull the minimum and median down.
     """
-    import pandas as pd  # imported here so the Docker launcher needs no pandas
-
     rows = []
     for r in results:
         if not r.samples:
             continue
-        vals = pd.Series([s.goodput_bps / 1e6 for s in r.samples])   # bits/s -> Mbps
+        vals = [s.goodput_bps / 1e6 for s in r.samples]      # bits/s -> Mbps
         rows.append({
             "destination": f"{r.host}:{r.port}",
-            "algorithm": r.algorithm,     # read from the data socket (TCP_CONGESTION)
-            "min_Mbps": vals.min(),
-            "median_Mbps": vals.median(),
-            "mean_Mbps": vals.mean(),
-            "p95_Mbps": vals.quantile(0.95),
+            "algorithm": r.algorithm,          # read from the data socket (TCP_CONGESTION)
+            "min_Mbps": min(vals),
+            "median_Mbps": statistics.median(vals),
+            "mean_Mbps": statistics.mean(vals),
+            "p95_Mbps": _percentile(vals, 95),
         })
-    return pd.DataFrame(rows)
+    return rows
 
 
+def print_summary_table(rows: list[dict]) -> None:
+    """Print the summary table to the terminal as aligned columns."""
+    if not rows:
+        print("(no samples to summarize)")
+        return
+    fmt = lambda v: f"{v:.6f}" if isinstance(v, float) else str(v)
+    table = [[fmt(row[c]) for c in SUMMARY_COLUMNS] for row in rows]
+    widths = [max([len(h)] + [len(line[i]) for line in table])
+              for i, h in enumerate(SUMMARY_COLUMNS)]
+    print("  ".join(h.rjust(w) for h, w in zip(SUMMARY_COLUMNS, widths)))
+    for line in table:
+        print("  ".join(cell.rjust(w) for cell, w in zip(line, widths)))
+
+
+def write_summary_csv(rows: list[dict], path: Path) -> None:
+    """Save the summary table as a CSV file."""
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS, lineterminator="\n")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ---- 1(c).4  Plot throughput over time ---------------------------------------
 def plot_goodput(results: list[TestResult], out_path: Path) -> None:
     """Plot goodput over time, one panel per destination, saved to out_path."""
     import matplotlib
@@ -711,9 +775,9 @@ def plot_goodput(results: list[TestResult], out_path: Path) -> None:
     print(f"Saved plot: {out_path}")
 
 
-# ==============================================================================
-# Docker launcher
-# ==============================================================================
+# ##############################################################################
+# DOCKER LAUNCHER (convenience only; not part of the assignment logic)
+# ##############################################################################
 IMAGE_NAME = "cs422-assignment2"
 
 
@@ -743,9 +807,9 @@ def launch_in_docker(argv: list[str]) -> int:
     return subprocess.run(cmd).returncode
 
 
-# ==============================================================================
-# Entry point
-# ==============================================================================
+# ##############################################################################
+# ENTRY POINT
+# ##############################################################################
 def main():
     """Parse arguments, run the experiment, and write all outputs."""
     parser = argparse.ArgumentParser(description="CS 422 Assignment 2, Part 1")
@@ -767,10 +831,10 @@ def main():
 
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    # 1(a)+(b): pick destinations and run the iperf3 test against each.
+    # ---- Part 1(a) + 1(b): pick destinations and run the iperf3 test on each ----
     results, log_lines = select_destinations(args.n, args.duration, args.max_extra_attempts)
 
-    # 1(b): record the servers tried, with pass/fail and any shortfall.
+    # ---- Part 1(b): record the servers tried, with pass/fail and any shortfall ----
     log_path = RESULTS_DIR / "destination_log.txt"
     log_path.write_text("\n".join(log_lines) + "\n")
     print(f"Destination log written to {log_path}")
@@ -779,13 +843,14 @@ def main():
         print("No successful destinations -- nothing to plot or summarize.")
         sys.exit(1)
 
-    # 1(c): save every raw goodput sample ("compute and record").
+    # ---- Part 1(c): save every raw goodput sample ("compute and record") ----
     samples_path = RESULTS_DIR / "goodput_samples.csv"
     with open(samples_path, "w", encoding="utf-8") as f:
         f.write("destination,elapsed_s,bytes_acked,goodput_bps\n")
         for r in results:
             for s in r.samples:
-                f.write(f"{r.host}:{r.port},{s.elapsed_s:.3f},{s.bytes_acked},{s.goodput_bps:.1f}\n")
+                writer.writerow([f"{r.host}:{r.port}", f"{s.elapsed_s:.3f}",
+                                 s.bytes_acked, f"{s.goodput_bps:.1f}"])
     print(f"Raw samples written to {samples_path}")
 
     save_tcp_stats_export(
@@ -796,11 +861,12 @@ def main():
     # 1(c): summary table (min / median / mean / p95 per destination).
     summary = build_summary_table(results)
     print("\nSummary (Mbps):")
-    print(summary.to_string(index=False))
-    summary.to_csv(RESULTS_DIR / "summary_table.csv", index=False)
-    print(f"Summary table written to {RESULTS_DIR / 'summary_table.csv'}")
+    print_summary_table(summary_rows)
+    summary_path = RESULTS_DIR / "summary_table.csv"
+    write_summary_csv(summary_rows, summary_path)
+    print(f"Summary table written to {summary_path}")
 
-    # 1(c): goodput-vs-time plot, one panel per destination.
+    # ---- Part 1(c): goodput-versus-time plot, one panel per destination ----
     plot_goodput(results, RESULTS_DIR / "goodput_plot.png")
 
 

@@ -35,6 +35,14 @@ docker build -t cs422-assignment2 .
 docker run --rm --user "$(id -u):$(id -g)" -e MPLCONFIGDIR=/tmp \
   -v "$PWD:/app" cs422-assignment2 --n 10 --duration 10
 ```
+You can also run the container directly (Windows only):
+```bash
+docker build -t cs422-assignment2 .
+docker run --rm `
+  -e MPLCONFIGDIR=/tmp `
+  -v "$($PWD.Path):/app" `
+  cs422-assignment2 --n 10 --duration 10
+```
 
 ### Command-line options
 
