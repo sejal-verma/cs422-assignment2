@@ -1,6 +1,6 @@
 """CS 422 Assignment 2 -- Parts 1 & 2: iPerf Throughput & TCP Statistics Tracing.
 See README.md for usage, the iperf3 protocol flow, and output files.
-"""CS 422 Assignment 2 -- Part 1: iPerf Throughput Application.
+CS 422 Assignment 2 -- Part 1: iPerf Throughput Application.
 
 See README.md for usage, the iperf3 protocol flow, and the output files.
 
@@ -702,6 +702,29 @@ def save_tcp_stats_export(
     print(f"TCP stats metadata documentation written to {json_metadata_path}")
 
 
+
+SUMMARY_COLUMNS = [
+    "destination",
+    "algorithm",
+    "min_Mbps",
+    "median_Mbps",
+    "mean_Mbps",
+    "p95_Mbps",
+]
+
+
+def _percentile(values: list[float], pct: float) -> float:
+    """Return a percentile using linear interpolation between adjacent values."""
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+
+    pos = (pct / 100.0) * (len(ordered) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+
+
 def build_summary_table(results: list[TestResult]):
     """Build a per-destination table of min / median / mean / p95 goodput (Mbps).
 
@@ -845,8 +868,9 @@ def main():
 
     # ---- Part 1(c): save every raw goodput sample ("compute and record") ----
     samples_path = RESULTS_DIR / "goodput_samples.csv"
-    with open(samples_path, "w", encoding="utf-8") as f:
-        f.write("destination,elapsed_s,bytes_acked,goodput_bps\n")
+    with open(samples_path, "w", newline="") as f:
+        writer = csv.writer(f, lineterminator="\n")
+        writer.writerow(["destination", "elapsed_s", "bytes_acked", "goodput_bps"])
         for r in results:
             for s in r.samples:
                 writer.writerow([f"{r.host}:{r.port}", f"{s.elapsed_s:.3f}",
@@ -859,7 +883,7 @@ def main():
         RESULTS_DIR / "tcp_stats_metadata.json",
     )
     # 1(c): summary table (min / median / mean / p95 per destination).
-    summary = build_summary_table(results)
+    summary_rows = build_summary_table(results)
     print("\nSummary (Mbps):")
     print_summary_table(summary_rows)
     summary_path = RESULTS_DIR / "summary_table.csv"
