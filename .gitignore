@@ -3,6 +3,8 @@ destination_log.txt
 goodput_samples.csv
 summary_table.csv
 goodput_plot.png
+tcp_stats_trace.csv
+tcp_stats_metadata.json
 venv/
 .venv/
 __pycache__/
