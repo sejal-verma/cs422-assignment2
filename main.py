@@ -1,111 +1,63 @@
-"""CS 422 Assignment 2 -- Parts 1 & 2: iPerf Throughput & TCP Statistics Tracing.
-See README.md for usage, the iperf3 protocol flow, and output files.
-CS 422 Assignment 2 -- Part 1: iPerf Throughput Application.
+"""CS 422 Assignment 2 -- Parts 1 & 2(a): iperf3 client + TCP statistics trace.
 
-See README.md for usage, the iperf3 protocol flow, and the output files.
+Run:   python3 main_simplified.py --n 10 --duration 10
+Needs: Linux (for TCP_INFO), matplotlib, numpy.
 
-Everything that touches the network uses only Python's standard library:
-  socket   plain TCP sockets, getsockopt() for TCP statistics
-  struct   packing/unpacking protocol bytes
-  json     the iperf3 JSON messages
-  ctypes   decoding the kernel's struct tcp_info returned by getsockopt()
-  urllib   downloading the public server list
-No iperf3 binary, no iperf3 library, and no custom receiver are used.
-The only third-party package is matplotlib, used just to draw the plot.
+Outputs: destination_log.txt, tcp_stats_trace.csv, summary_table.csv, goodput_plot.png
 
-Layout of this file (search for the banners below)
-  Configuration
-  PART 1(a)  iperf3 client written from scratch with plain sockets
-  PART 1(b)  destination selection, failure logging, bounded replacement
-  PART 1(c)  goodput from TCP_INFO, summary table, plot
-  Launcher   optional Docker hand-off, then the entry point
+How the numbers are computed (copy into the report):
+  decoding   : getsockopt(IPPROTO_TCP, TCP_INFO) on the DATA socket, decoded with a
+               ctypes mirror of Linux `struct tcp_info` (fields in kernel order).
+  goodput    : (bytes_acked_now - bytes_acked_prev) * 8 / (t_now - t_prev)   [bits/s]
+  loss proxy : new_retrans = total_retrans_now - total_retrans_prev  [segments/interval]
+               (lost = tcpi_lost, the kernel's current count of segments presumed lost)
 """
-
-from __future__ import annotations
 
 import argparse
 import csv
 import ctypes
 import json
-import os
 import random
 import socket
-import statistics
 import string
 import struct
-import subprocess
 import sys
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Callable, Optional
 
+import matplotlib
+matplotlib.use("Agg")          # draw plots without a display
+import matplotlib.pyplot as plt
+import numpy as np
 
-# ##############################################################################
-# CONFIGURATION
-# Defaults used when no command-line option is given (see main() for the flags).
-# ##############################################################################
-N_DESTINATIONS = 10            # how many successful destinations we want  (--n)
-DURATION = 10.0                # seconds of sending per destination          (--duration)
-MAX_REPLACEMENT_ATTEMPTS = 30  # extra tries allowed when servers fail       (--max-extra-attempts)
-SAMPLE_INTERVAL = 0.2          # goodput sampling period in seconds (200 ms)
-
-# Official JSON export of iperf3serverlist.net. The website's own table is
-# rendered by JavaScript, so it can't be read with a plain HTTP request.
+# configuration
+N_DESTINATIONS = 10            # --n
+DURATION = 10.0                # --duration (seconds of sending per destination)
+MAX_REPLACEMENT_ATTEMPTS = 30  # --max-extra-attempts
+SAMPLE_INTERVAL = 0.2          # seconds between samples
 SERVER_LIST_URL = "https://export.iperf3serverlist.net/listed_iperf3_servers.json"
-RESULTS_DIR = Path(".")        # output files are written to the project folder
+RESULTS_DIR = Path(".")
 
-
-# ##############################################################################
-# PART 1(a)  |  Write a socket program from scratch: the iperf3 client
-#
-# Requirements covered here:
-#   (i)   establish the control connection
-#   (ii)  JSON-based parameter exchange
-#   (iii) open the data connection
-#   (iv)  transmit data continuously for a configurable duration
-#   (v)   terminate the test following iperf3 semantics
-#   plus robust handling of unresponsive servers, rejected parameters,
-#   connection timeouts, and premature connection termination.
-#
-# Only plain TCP sockets are used. The only socket setting we change is the
-# timeout, so buffers, Nagle, and the congestion control algorithm all stay at
-# the operating system defaults.
-# ##############################################################################
-
-# ---- 1(a).1  Protocol constants ----------------------------------------------
-COOKIE_SIZE = 37               # iperf3 cookie: 36 random chars + NUL terminator
-
-# Single-byte "state" values sent over the control connection.
-# Positive values are normal protocol steps; negative values are errors.
-TEST_START = 1
-TEST_RUNNING = 2
-TEST_END = 4
-PARAM_EXCHANGE = 9
-CREATE_STREAMS = 10
-EXCHANGE_RESULTS = 13
-DISPLAY_RESULTS = 14
-IPERF_DONE = 16
-ACCESS_DENIED = -1             # server is busy or rejected us
-SERVER_ERROR = -2              # followed by two 4-byte error codes
-
-DEFAULT_BLKSIZE = 128 * 1024   # bytes written per send() call (iperf3 default)
-CONNECT_TIMEOUT = 5.0          # seconds to wait for a TCP connect
-IO_TIMEOUT = 10.0              # seconds to wait for a control-channel read
+# protocol constants
+COOKIE_SIZE = 37               # 36 random chars + NUL
+TEST_START, TEST_RUNNING, TEST_END = 1, 2, 4          # iperf3 state bytes
+PARAM_EXCHANGE, CREATE_STREAMS = 9, 10
+EXCHANGE_RESULTS, DISPLAY_RESULTS, IPERF_DONE = 13, 14, 16
+ACCESS_DENIED, SERVER_ERROR = -1, -2                  # negative = error
+DEFAULT_BLKSIZE = 128 * 1024   # bytes per send()
+CONNECT_TIMEOUT = 5.0
+IO_TIMEOUT = 10.0
 
 
 # ==============================================================================
-# Part 1(c) & Part 2(a): reading TCP statistics from the data socket
+# Reading TCP statistics from the data socket (Part 1(c) and 2(a))
 # ==============================================================================
 class _TCPInfoPrefix(ctypes.Structure):
-    """Leading and extended fields of Linux's `struct tcp_info`.
-
-    Includes the fields needed for goodput and Part 2 TCP statistics.
-    ctypes applies the same natural alignment as the kernel's C struct, so
-    tcpi_bytes_acked ends up at byte offset 120 without manual offset math.
-    (Field order must match the kernel header exactly.)
-    """
+    """Leading fields of Linux's `struct tcp_info`, in kernel order.
+    ctypes uses the same alignment as C, so tcpi_bytes_acked lands at offset 120."""
     _fields_ = [
         ("tcpi_state", ctypes.c_uint8),
         ("tcpi_ca_state", ctypes.c_uint8),
@@ -114,7 +66,7 @@ class _TCPInfoPrefix(ctypes.Structure):
         ("tcpi_backoff", ctypes.c_uint8),
         ("tcpi_options", ctypes.c_uint8),
         ("tcpi_wscale_byte", ctypes.c_uint8),   # snd/rcv wscale packed in one byte
-        ("tcpi_flags_byte", ctypes.c_uint8),    # delivery_rate_app_limited etc.
+        ("tcpi_flags_byte", ctypes.c_uint8),
         ("tcpi_rto", ctypes.c_uint32),
         ("tcpi_ato", ctypes.c_uint32),
         ("tcpi_snd_mss", ctypes.c_uint32),
@@ -141,421 +93,324 @@ class _TCPInfoPrefix(ctypes.Structure):
         ("tcpi_total_retrans", ctypes.c_uint32),
         ("tcpi_pacing_rate", ctypes.c_uint64),
         ("tcpi_max_pacing_rate", ctypes.c_uint64),
-        ("tcpi_bytes_acked", ctypes.c_uint64),  # <-- the field Part 1(c) needs
+        ("tcpi_bytes_acked", ctypes.c_uint64),
     ]
 
 
-# TCP_INFO option number; Python exposes socket.TCP_INFO on Linux, and the
-# value is 11 there, so fall back to 11 if the constant is missing.
-_TCP_INFO_OPT = getattr(socket, "TCP_INFO", 11)
+_TCP_INFO_OPT = getattr(socket, "TCP_INFO", 11)   # 11 on Linux
 
 
-def get_bytes_acked(data_sock: socket.socket) -> Optional[int]:
-    """Return the cumulative number of bytes the peer has ACKed on this socket.
-
-    Reads the kernel's TCP_INFO via getsockopt() and returns tcpi_bytes_acked.
-    Returns None if the value can't be read (e.g. not running on Linux).
-    """
+def read_tcp_info(sock: socket.socket) -> Optional[_TCPInfoPrefix]:
+    """Read and decode TCP_INFO. Returns None if unavailable (not Linux / old kernel)."""
     try:
-        raw = data_sock.getsockopt(socket.IPPROTO_TCP, _TCP_INFO_OPT,
-                                   ctypes.sizeof(_TCPInfoPrefix))
-        # Older kernels may return a shorter struct that lacks bytes_acked.
-        if len(raw) < ctypes.sizeof(_TCPInfoPrefix):
-            return None
-        return _TCPInfoPrefix.from_buffer_copy(raw).tcpi_bytes_acked
-    except (OSError, AttributeError):
+        raw = sock.getsockopt(socket.IPPROTO_TCP, _TCP_INFO_OPT,
+                              ctypes.sizeof(_TCPInfoPrefix))
+    except OSError:
         return None
+    if len(raw) < ctypes.sizeof(_TCPInfoPrefix):
+        return None
+    return _TCPInfoPrefix.from_buffer_copy(raw)
 
 
 def get_congestion_algorithm(sock: socket.socket) -> str:
-    """Return the name of the congestion-control algorithm the kernel is using
-    for this socket (e.g. "cubic"), read via getsockopt(TCP_CONGESTION).
-    Returns "unknown" if it can't be read."""
+    """Congestion control algorithm the kernel is using for this socket."""
     try:
         opt = getattr(socket, "TCP_CONGESTION", 13)   # 13 on Linux
         raw = sock.getsockopt(socket.IPPROTO_TCP, opt, 16)
         return raw.split(b"\x00", 1)[0].decode("ascii") or "unknown"
-    except (OSError, AttributeError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError):
         return "unknown"
 
 
 # ==============================================================================
-# Part 1(a): low-level protocol helpers
+# iperf3 protocol helpers (Part 1(a))
 # ==============================================================================
 def make_cookie() -> bytes:
-    """Build a random 37-byte iperf3 cookie (36 alphanumerics + NUL).
-
-    The cookie identifies one test: it is sent on the control connection and
-    again on the data connection so the server can pair the two.
-    """
+    """Random 37-byte cookie; sent on both connections so the server can pair them."""
     body = "".join(random.choices(string.ascii_letters + string.digits, k=COOKIE_SIZE - 1))
     return (body + "\x00").encode("ascii")
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
-    """Read exactly n bytes from a TCP socket.
-
-    TCP is a byte stream, so recv(n) may return fewer than n bytes. Loop until
-    all n arrive, and raise if the peer closes the connection early.
-    """
-    chunks, remaining = [], n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:  # empty read means the peer closed the connection
-            raise ConnectionError(f"peer closed while expecting {n} bytes ({remaining} left)")
-        chunks.append(chunk)
-        remaining -= len(chunk)
-    return b"".join(chunks)
+    """TCP is a byte stream: keep reading until exactly n bytes have arrived."""
+    data = b""
+    while len(data) < n:
+        chunk = sock.recv(n - len(data))
+        if not chunk:
+            raise ConnectionError(f"peer closed while expecting {n} bytes")
+        data += chunk
+    return data
 
 
 def send_json(sock: socket.socket, obj: dict) -> None:
-    """Send a JSON message using iperf3 framing:
-    a 4-byte big-endian length, followed by that many bytes of JSON text.
-    """
+    """iperf3 framing: 4-byte big-endian length, then the JSON text."""
     payload = json.dumps(obj).encode("utf-8")
     sock.sendall(struct.pack("!I", len(payload)) + payload)
 
 
 def recv_json(sock: socket.socket) -> dict:
-    """Receive one length-prefixed JSON message (inverse of send_json)."""
     (length,) = struct.unpack("!I", recv_exact(sock, 4))
-    # Sanity check: a garbage length would make us wait for gigabytes.
-    if length > 1_000_000:
+    if length > 1_000_000:                      # garbage length: don't wait for GBs
         raise ConnectionError(f"implausible JSON length {length}")
     return json.loads(recv_exact(sock, length).decode("utf-8"))
 
 
 # ==============================================================================
-# Data containers (Parts 1 & 2)
+# Data containers
 # ==============================================================================
 @dataclass
-class GoodputSample:
-    """One periodic sample containing goodput and low-level TCP statistics."""
-    elapsed_s: float       # seconds since the send loop started
-    bytes_acked: int       # cumulative ACKed bytes at this instant (from TCP_INFO)
-    goodput_bps: float     # (delta bytes acked) * 8 / (delta time), bits per second
-    destination: str = ""
-    algorithm: str = "unknown"
-    run_id: str = ""
-    snd_cwnd: int = 0
-    rtt_us: float = 0.0
-    rtt_ms: float = 0.0
-    rttvar_us: int = 0
-    total_retrans: int = 0
-    lost: int = 0
-    pacing_rate_bps: int = 0
+class TCPSample:
+    """One sampling interval. Units are in the field names."""
+    elapsed_s: float         # seconds since the send loop started
+    goodput_bps: float       # bits/s, from the change in bytes_acked
+    snd_cwnd: int            # congestion window, segments
+    rtt_us: int              # smoothed RTT, microseconds
+    rttvar_us: int           # RTT variation, microseconds
+    total_retrans: int       # cumulative retransmitted segments
+    new_retrans: int         # retransmitted segments during this interval (loss proxy)
+    lost: int                # segments the kernel currently presumes lost
+    pacing_rate_Bps: int     # bytes/s
+    bytes_acked: int         # cumulative bytes ACKed
+
 
 @dataclass
 class TestResult:
     """Everything we learn from testing one destination."""
     host: str
     port: int
-    success: bool = False                    # True only if the full protocol completed
-    error: Optional[str] = None              # reason for failure, if any
-    bytes_sent: int = 0                      # bytes handed to send() by our client
-    duration_actual: float = 0.0             # real length of the send loop (s)
-    algorithm: str = "unknown"               # TCP congestion control actually used
-    server_results: Optional[dict] = None    # results JSON sent back by the server
-    samples: list = field(default_factory=list)  # goodput samples, see 1(c).2
+    run_id: str = ""
+    success: bool = False
+    error: Optional[str] = None
+    bytes_sent: int = 0
+    duration_actual: float = 0.0
+    algorithm: str = "unknown"
+    server_results: Optional[dict] = None
+    samples: list = field(default_factory=list)   # list[TCPSample]
 
 
-# ---- 1(a).4  The client ------------------------------------------------------
+# ==============================================================================
+# Sampler: turns periodic TCP_INFO readings into TCPSamples
+# ==============================================================================
+class TCPStatsSampler:
+    """Callback object for Iperf3Client. The first call only records a baseline
+    (a rate needs two readings); every later call appends one TCPSample."""
+
+    def __init__(self):
+        self.samples: list[TCPSample] = []
+        self._prev = None      # (elapsed_s, bytes_acked, total_retrans) at last reading
+
+    def on_sample(self, data_sock: socket.socket, elapsed_s: float, _bytes_sent: int) -> None:
+        info = read_tcp_info(data_sock)
+        if info is None:
+            return
+
+        if self._prev is not None:
+            prev_t, prev_acked, prev_retrans = self._prev
+            dt = elapsed_s - prev_t                      # actual elapsed time
+            if dt < SAMPLE_INTERVAL / 2:
+                return                                   # too short: noisy rate
+            self.samples.append(TCPSample(
+                elapsed_s=round(elapsed_s, 3),
+                goodput_bps=round((info.tcpi_bytes_acked - prev_acked) * 8 / dt, 1),
+                snd_cwnd=info.tcpi_snd_cwnd,
+                rtt_us=info.tcpi_rtt,
+                rttvar_us=info.tcpi_rttvar,
+                total_retrans=info.tcpi_total_retrans,
+                new_retrans=info.tcpi_total_retrans - prev_retrans,
+                lost=info.tcpi_lost,
+                pacing_rate_Bps=info.tcpi_pacing_rate,
+                bytes_acked=info.tcpi_bytes_acked,
+            ))
+
+        self._prev = (elapsed_s, info.tcpi_bytes_acked, info.tcpi_total_retrans)
+
+
+# ==============================================================================
+# The iperf3 client (Part 1(a))
+# ==============================================================================
 class Iperf3Client:
     """A minimal iperf3 client: one TCP stream, client -> server direction."""
 
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        duration: float = 10.0,
-        blksize: int = DEFAULT_BLKSIZE,
-        on_sample: Optional[Callable[[socket.socket, float, int], None]] = None,
-    ):
-        """
-        host, port  : the iperf3 server to test
-        duration    : seconds to send data
-        blksize     : bytes per send() call
-        on_sample   : callback invoked every SAMPLE_INTERVAL with
-                      (data_socket, elapsed_seconds, bytes_sent_so_far);
-                      used to record goodput without coupling this class to it
-        """
+    def __init__(self, host: str, port: int, duration: float = 10.0,
+                 blksize: int = DEFAULT_BLKSIZE,
+                 on_sample: Optional[Callable[[socket.socket, float, int], None]] = None):
         self.host = host
         self.port = port
         self.duration = duration
         self.blksize = blksize
-        self.on_sample = on_sample
+        self.on_sample = on_sample        # called every SAMPLE_INTERVAL with (data_sock, elapsed, bytes_sent)
         self.cookie = make_cookie()
-        self.ctrl_sock: Optional[socket.socket] = None   # control connection
-        self.data_sock: Optional[socket.socket] = None   # data connection
-        self._peer_ip: Optional[str] = None              # IP the control socket used
+        self.ctrl_sock: Optional[socket.socket] = None
+        self.data_sock: Optional[socket.socket] = None
+        self._peer_ip: Optional[str] = None
 
     def _open_control(self) -> None:
-        """Step (i): open the control connection and send the cookie."""
+        """Step (i): control connection + cookie."""
         sock = socket.create_connection((self.host, self.port), timeout=CONNECT_TIMEOUT)
         sock.settimeout(IO_TIMEOUT)
         sock.sendall(self.cookie)
         self.ctrl_sock = sock
-        # Remember the exact IP used so the data socket uses the same
-        # address family / address (avoids an IPv4 vs IPv6 mismatch).
-        self._peer_ip = sock.getpeername()[0]
+        self._peer_ip = sock.getpeername()[0]   # reuse the exact IP for the data socket
 
     def _open_data_stream(self) -> None:
-        """Step (iii): open the data connection and identify it with the cookie."""
+        """Step (iii): data connection + the same cookie."""
         sock = socket.create_connection((self._peer_ip, self.port), timeout=CONNECT_TIMEOUT)
         sock.settimeout(IO_TIMEOUT)
         sock.sendall(self.cookie)
         self.data_sock = sock
 
     def _send_test_params(self) -> None:
-        """Step (ii): send the JSON test parameters requested by the server."""
+        """Step (ii): JSON test parameters."""
         send_json(self.ctrl_sock, {
-            "tcp": True,                    # TCP test (not UDP/SCTP)
-            "omit": 0,                      # no warm-up seconds to discard
-            "time": int(self.duration),     # test length; iperf3 expects an integer
-            "parallel": 1,                  # a single data stream
-            "len": self.blksize,            # bytes per write
-            "client_version": "3.9",        # iperf3 sends this; some servers check it
+            "tcp": True, "omit": 0, "time": int(self.duration),
+            "parallel": 1, "len": self.blksize, "client_version": "3.9",
         })
 
     def _run_send_loop(self, result: TestResult) -> None:
-        """Step (iv): send data for `duration` seconds while sampling goodput.
+        """Step (iv): send zeros for `duration` seconds, sampling on a timer.
 
-        Sampling is driven by a timer check at the top of each loop iteration,
-        NOT by send() returning, so that a full send buffer (which makes send()
-        block) can't delay or skip samples.
-        """
+        Sampling is checked at the top of every iteration (not after send()
+        returns), so a full send buffer can't delay or skip samples."""
         result.algorithm = get_congestion_algorithm(self.data_sock)
-        sampler = getattr(self.on_sample, "__self__", None)
-        if sampler is not None and hasattr(sampler, "set_algorithm"):
-            sampler.set_algorithm(result.algorithm)
-        buf = bytes(self.blksize)               # payload: a block of zero bytes
-        start = time.monotonic()                # monotonic clock: immune to clock changes
+        buf = bytes(self.blksize)
+        start = time.monotonic()
         deadline = start + self.duration
         last_sample = start
-        # Short timeout so send() never blocks long enough to delay sampling.
-        self.data_sock.settimeout(SAMPLE_INTERVAL / 4)
+        self.data_sock.settimeout(SAMPLE_INTERVAL / 4)   # send() never blocks long
 
-        # Baseline sample at t=0 so the first interval is captured too.
         if self.on_sample:
-            self.on_sample(self.data_sock, 0.0, 0)
+            self.on_sample(self.data_sock, 0.0, 0)       # baseline at t=0
 
         while True:
             now = time.monotonic()
             if now >= deadline:
                 break
-
-            # Sample on schedule, regardless of whether send() made progress.
             if self.on_sample and (now - last_sample) >= SAMPLE_INTERVAL:
                 self.on_sample(self.data_sock, now - start, result.bytes_sent)
                 last_sample = now
-
             try:
-                # send() returns how many bytes were accepted (may be < blksize).
                 result.bytes_sent += self.data_sock.send(buf)
             except socket.timeout:
-                continue  # send buffer full; loop back to sample/check deadline
+                continue                                 # buffer full; go sample / check deadline
             except (BrokenPipeError, ConnectionResetError) as e:
                 raise ConnectionError(f"data connection dropped mid-transfer: {e}")
 
         result.duration_actual = time.monotonic() - start
-        # One last sample at the end. (The sampler ignores it if the interval
-        # since the previous sample is too short to give a stable rate.)
         if self.on_sample:
             self.on_sample(self.data_sock, result.duration_actual, result.bytes_sent)
 
     def _send_results(self, result: TestResult) -> None:
-        """Send our side's results JSON during EXCHANGE_RESULTS.
-
-        The server requires the "streams" list; a results message without it
-        is rejected. Stream id 1 is what iperf3 uses for a single stream.
-        Fields we can't measure are sent as 0 or -1 (unknown).
-        """
+        """Our side's results JSON; the server rejects it without "streams"."""
         send_json(self.ctrl_sock, {
-            "cpu_util_total": 0.0,
-            "cpu_util_user": 0.0,
-            "cpu_util_system": 0.0,
-            "sender_has_retransmits": -1,   # -1 = we don't report retransmits
-            "streams": [{
-                "id": 1,
-                "bytes": result.bytes_sent,
-                "retransmits": -1,
-                "jitter": 0,
-                "errors": 0,
-                "packets": 0,
-                "start_time": 0,
-                "end_time": result.duration_actual,
-            }],
+            "cpu_util_total": 0.0, "cpu_util_user": 0.0, "cpu_util_system": 0.0,
+            "sender_has_retransmits": -1,
+            "streams": [{"id": 1, "bytes": result.bytes_sent, "retransmits": -1,
+                         "jitter": 0, "errors": 0, "packets": 0,
+                         "start_time": 0, "end_time": result.duration_actual}],
         })
 
     def run(self) -> TestResult:
-        """Run one complete iperf3 test and return the outcome.
-
-        Never raises for network problems: any failure is captured in
-        result.error and result.success stays False, so the caller can log it
-        and move on to a replacement server.
-        """
+        """Run one full iperf3 test. Never raises for network problems:
+        failures are stored in result.error so the caller can pick a replacement."""
         result = TestResult(host=self.host, port=self.port)
         try:
             self._open_control()
-
-            # The server drives the protocol by sending one state byte at a
-            # time on the control connection; we react to each state.
+            # The server drives the protocol with one state byte at a time.
             while True:
-                state = struct.unpack("b", recv_exact(self.ctrl_sock, 1))[0]  # signed byte
+                state = struct.unpack("b", recv_exact(self.ctrl_sock, 1))[0]   # signed
 
                 if state == PARAM_EXCHANGE:
                     self._send_test_params()
                 elif state == CREATE_STREAMS:
                     self._open_data_stream()
                 elif state == TEST_START:
-                    pass  # nothing to do; wait for TEST_RUNNING
+                    pass
                 elif state == TEST_RUNNING:
                     self._run_send_loop(result)
-                    # Step (v): the client is the one that ends the test.
-                    self.ctrl_sock.sendall(struct.pack("b", TEST_END))
+                    self.ctrl_sock.sendall(struct.pack("b", TEST_END))   # step (v)
                 elif state == EXCHANGE_RESULTS:
                     self._send_results(result)
                     result.server_results = recv_json(self.ctrl_sock)
                 elif state == DISPLAY_RESULTS:
-                    # Final handshake step: tell the server we're done.
                     self.ctrl_sock.sendall(struct.pack("b", IPERF_DONE))
                     result.success = True
                     break
                 elif state == ACCESS_DENIED:
-                    # Server busy or rejected our parameters.
                     raise ConnectionError("server sent ACCESS_DENIED (busy or rejected params)")
                 elif state == SERVER_ERROR:
-                    i_errno, _errno = struct.unpack("!ii", recv_exact(self.ctrl_sock, 8))
+                    i_errno, _ = struct.unpack("!ii", recv_exact(self.ctrl_sock, 8))
                     raise ConnectionError(f"server reported SERVER_ERROR (i_errno {i_errno})")
                 else:
-                    raise ConnectionError(f"unrecognized state byte {state} -- verify with Wireshark")
+                    raise ConnectionError(f"unrecognized state byte {state}")
 
-        # ---- robust error handling required by 1(a) ----
         except socket.timeout:
-            result.error = "timeout (server non-responsive)"        # unresponsive / connect timeout
+            result.error = "timeout (server non-responsive)"
         except ConnectionRefusedError:
             result.error = "connection refused"
         except (ConnectionResetError, BrokenPipeError) as e:
-            result.error = f"connection reset/broken pipe: {e}"     # premature termination
+            result.error = f"connection reset/broken pipe: {e}"
         except (ConnectionError, OSError) as e:
-            result.error = str(e)   # includes premature close, ACCESS_DENIED, SERVER_ERROR, DNS errors
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            result.error = str(e)          # premature close, ACCESS_DENIED, DNS errors, ...
+        except ValueError as e:            # JSONDecodeError / UnicodeDecodeError
             result.error = f"malformed JSON from server: {e}"
         finally:
-            # Always close both sockets, even after an error.
             for s in (self.data_sock, self.ctrl_sock):
                 if s is not None:
-                    try:
-                        s.close()
-                    except OSError:
-                        pass
-
+                    s.close()
         return result
 
 
-# ##############################################################################
-# PART 1(b)  |  Destination selection
-#
-# Requirements covered here:
-#   - pick n random servers from the public list (n set with --n, default 10)
-#   - record the selected server addresses and ports
-#   - log a failure and try a replacement, with a bounded number of attempts
-#   - report any shortfall against the requested n
-# ##############################################################################
-class _Redirect308(urllib.request.HTTPRedirectHandler):
-    """Python < 3.11 does not follow HTTP 308 redirects; treat 308 like 301."""
-    def http_error_308(self, req, fp, code, msg, headers):
-        return self.http_error_302(req, fp, 301, msg, headers)
-
-
+# ==============================================================================
+# Destination selection (Part 1(b))
+# ==============================================================================
 def fetch_server_pool() -> list[tuple[str, int]]:
-    """Download the public iperf3 server list and expand it to (host, port) pairs.
-
-    Some entries list a port range such as "5201-5209"; ports in a range are
-    equivalent listeners, so one is picked at random. Missing or unparseable
-    ports fall back to the iperf3 default, 5201.
-    """
-    opener = urllib.request.build_opener(_Redirect308)
+    """Download the public server list as (host, port) pairs.
+    A port range like "5201-5209" -> one random port from it; missing/bad -> 5201."""
     req = urllib.request.Request(SERVER_LIST_URL, headers={"User-Agent": "cs422-iperf-client/1.0"})
-    with opener.open(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=10) as resp:
         entries = json.loads(resp.read().decode("utf-8"))
 
     pool = []
     for entry in entries:
         host = (entry.get("IP/HOST") or "").strip()
-        port_field = (entry.get("PORT") or "").strip()
         if not host:
-            continue  # skip entries with no address
-
-        if not port_field:
-            port = 5201                                  # no port listed -> default
-        elif "-" in port_field:                          # range, e.g. "5201-5209"
-            try:
-                lo, hi = (int(x) for x in port_field.split("-", 1))
-                port = random.randint(lo, hi)
-            except ValueError:
-                port = 5201
-        else:                                            # single port
-            try:
-                port = int(port_field)
-            except ValueError:
-                port = 5201
-
+            continue
+        lo, _, hi = (entry.get("PORT") or "").strip().partition("-")
+        try:
+            port = random.randint(int(lo), int(hi or lo))
+        except ValueError:
+            port = 5201
         pool.append((host, port))
-
     return pool
 
 
 def select_destinations(n: int, duration: float, max_extra_attempts: int):
-    """Randomly pick and test destinations until n succeed or attempts run out.
-
-    Servers are tried in random order. A failed server (busy, timeout, stalled,
-    etc.) is logged and replaced by the next candidate, up to
-    n + max_extra_attempts total attempts. Any shortfall is reported.
-
-    Returns (results, log_lines): the successful TestResults, and one log line
-    per attempt (plus a SHORTFALL line if fewer than n were reached).
-    """
+    """Test random servers until n succeed or n + max_extra_attempts are used.
+    Returns (successful TestResults, log lines)."""
     print(f"Fetching server pool from {SERVER_LIST_URL} ...")
     pool = fetch_server_pool()
     print(f"  {len(pool)} candidate servers available")
+    random.shuffle(pool)
 
-    random.shuffle(pool)           # random selection
-    candidates = iter(pool)        # each server is tried at most once
+    results, log_lines = [], []
+    attempts = 0
+    max_attempts = n + max_extra_attempts
 
-    results: list[TestResult] = []
-    log_lines: list[str] = []
-    attempts_used = 0
-    max_total_attempts = n + max_extra_attempts   # the "bounded number of attempts"
-
-    while len(results) < n and attempts_used < max_total_attempts:
-        try:
-            host, port = next(candidates)
-        except StopIteration:
-            log_lines.append("Ran out of candidate servers before reaching n.")
+    for host, port in pool:
+        if len(results) >= n or attempts >= max_attempts:
             break
+        attempts += 1
+        print(f"[{attempts}/{max_attempts}] Testing {host}:{port} ...")
 
-        attempts_used += 1
-        print(f"[{attempts_used}/{max_total_attempts}] Testing {host}:{port} ...")
-
-        # A fresh sampler per destination keeps each server's samples separate.
-        destination_str = f"{host}:{port}"
-        sampler = TCPStatsSampler(
-            destination=destination_str,
-            algorithm="unknown",
-            run_id=f"run_{attempts_used}",
-        )
+        sampler = TCPStatsSampler()          # fresh sampler keeps servers separate
         client = Iperf3Client(host, port, duration=duration, on_sample=sampler.on_sample)
         result = client.run()
         result.samples = sampler.samples
+        result.run_id = f"run_{attempts}"
 
-        # A run that "succeeded" but produced far fewer samples than expected
-        # means the connection stalled; its stats would be meaningless.
-        min_samples = max(3, int(0.5 * duration / SAMPLE_INTERVAL))
-        if result.success and len(result.samples) < min_samples:
+        if result.success and not result.samples:      # e.g. TCP_INFO unavailable
             result.success = False
-            result.error = (f"too few samples ({len(result.samples)} < {min_samples}); "
-                            f"connection stalled")
+            result.error = "no TCP_INFO samples recorded"
 
         if result.success:
             print(f"  OK  ({result.bytes_sent} bytes sent)")
@@ -565,332 +420,107 @@ def select_destinations(n: int, duration: float, max_extra_attempts: int):
             print(f"  FAIL: {result.error} -- trying a replacement")
             log_lines.append(f"FAIL  {host}:{port}  error={result.error}")
 
-    # Report any shortfall, as required by 1(b).
-    shortfall = n - len(results)
-    if shortfall > 0:
-        log_lines.append(f"SHORTFALL: requested {n}, got {len(results)} "
-                         f"(tried {attempts_used}/{max_total_attempts} attempts)")
-        print(f"\nShortfall: requested {n} destinations, only {len(results)} succeeded "
-              f"after {attempts_used} attempts.")
+    if len(results) < n:
+        msg = (f"SHORTFALL: requested {n}, got {len(results)} "
+               f"(tried {attempts}/{max_attempts} attempts)")
+        log_lines.append(msg)
+        print("\n" + msg)
     else:
         print(f"\nReached target of {n} successful destinations.")
-
     return results, log_lines
 
 
 # ==============================================================================
-# Part 1(c) & Part 2(a): TCP stats sampling, plotting, summary table
+# Outputs: trace CSV, summary table, plot
 # ==============================================================================
-class TCPStatsSampler:
-    """Capture TCP_INFO metrics and calculate interval goodput samples.
-
-    goodput(t) = (bytes_acked_now - bytes_acked_previous) * 8 / (t_now - t_previous)
-
-    Goodput counts only bytes the receiver has acknowledged, so it excludes
-    data still sitting in the send buffer or lost in flight.
-    """
-
-    def __init__(self, destination: str, algorithm: str = "unknown", run_id: str = "run_1"):
-        self.destination = destination
-        self.algorithm = algorithm
-        self.run_id = run_id
-        self.samples: list[GoodputSample] = []
-        self._last_time: Optional[float] = None    # time of the previous reading
-        self._last_bytes: Optional[int] = None     # bytes_acked at the previous reading
-
-    def set_algorithm(self, algorithm: str) -> None:
-        self.algorithm = algorithm
-
-    def on_sample(self, data_sock: socket.socket, elapsed_s: float, _bytes_sent: int) -> None:
-        """Callback given to Iperf3Client; called once per sampling tick."""
-        try:
-            raw = data_sock.getsockopt(
-                socket.IPPROTO_TCP,
-                _TCP_INFO_OPT,
-                ctypes.sizeof(_TCPInfoPrefix),
-            )
-            if len(raw) < ctypes.sizeof(_TCPInfoPrefix):
-                return
-            info = _TCPInfoPrefix.from_buffer_copy(raw)
-        except (OSError, AttributeError):
-            return  # TCP_INFO unavailable (not Linux); nothing to record
-
-        acked = info.tcpi_bytes_acked
-        goodput_bps = 0.0
-
-        if self._last_time is not None:
-            dt = elapsed_s - self._last_time            # actual elapsed sampling time
-            if dt < SAMPLE_INTERVAL / 2:
-                return  # too short an interval; would give a noisy goodput value
-            dbytes = acked - self._last_bytes           # difference of cumulative counters
-            goodput_bps = (dbytes * 8 / dt) if dt > 0 else 0.0   # bytes -> bits
-
-        self.samples.append(GoodputSample(
-            elapsed_s=round(elapsed_s, 3),
-            bytes_acked=acked,
-            goodput_bps=round(goodput_bps, 2),
-            destination=self.destination,
-            algorithm=self.algorithm,
-            run_id=self.run_id,
-            snd_cwnd=info.tcpi_snd_cwnd,
-            rtt_us=float(info.tcpi_rtt),
-            rtt_ms=round(info.tcpi_rtt / 1000.0, 3),
-            rttvar_us=info.tcpi_rttvar,
-            total_retrans=info.tcpi_total_retrans,
-            lost=info.tcpi_lost,
-            pacing_rate_bps=info.tcpi_pacing_rate,
-        ))
-
-        self._last_time = elapsed_s
-        self._last_bytes = acked
+def write_trace_csv(results: list[TestResult], path: Path) -> None:
+    """One row per sample, with destination / run_id / algorithm on every row."""
+    columns = ["destination", "run_id", "algorithm"] + [f.name for f in fields(TCPSample)]
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for r in results:
+            for s in r.samples:
+                writer.writerow({"destination": f"{r.host}:{r.port}", "run_id": r.run_id,
+                                 "algorithm": r.algorithm, **asdict(s)})
 
 
-def save_tcp_stats_export(
-    results: list[TestResult],
-    csv_path: Path,
-    json_metadata_path: Path,
-) -> None:
-    """Write the detailed TCP statistics trace and its metric documentation."""
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write(
-            "destination,run_id,algorithm,elapsed_s,goodput_bps,snd_cwnd,"
-            "rtt_us,rtt_ms,rttvar_us,total_retrans,lost,pacing_rate_bps,bytes_acked\n"
-        )
-        for result in results:
-            for sample in result.samples:
-                f.write(
-                    f"{sample.destination},{sample.run_id},{sample.algorithm},"
-                    f"{sample.elapsed_s:.3f},{sample.goodput_bps:.1f},"
-                    f"{sample.snd_cwnd},{sample.rtt_us:.1f},{sample.rtt_ms:.3f},"
-                    f"{sample.rttvar_us},{sample.total_retrans},{sample.lost},"
-                    f"{sample.pacing_rate_bps},{sample.bytes_acked}\n"
-                )
-    print(f"Detailed TCP stats CSV written to {csv_path}")
-
-    metadata = {
-        "description": "Part 2(a) TCP Statistics & Goodput Export",
-        "kernel_decoding": (
-            "Extracted via getsockopt(IPPROTO_TCP, TCP_INFO, struct tcp_info) "
-            "using a ctypes prefix mapping."
-        ),
-        "metrics": {
-            "elapsed_s": {
-                "unit": "seconds",
-                "description": "Time elapsed since send loop start via monotonic clock.",
-            },
-            "goodput_bps": {
-                "unit": "bits/second",
-                "formula": "(delta bytes_acked * 8) / delta time",
-            },
-            "snd_cwnd": {"unit": "segments/packets", "field": "tcpi_snd_cwnd"},
-            "rtt_us": {"unit": "microseconds", "field": "tcpi_rtt"},
-            "rtt_ms": {"unit": "milliseconds", "formula": "rtt_us / 1000.0"},
-            "rttvar_us": {"unit": "microseconds", "field": "tcpi_rttvar"},
-            "total_retrans": {
-                "unit": "packet count",
-                "field": "tcpi_total_retrans (Loss Signal)",
-            },
-            "lost": {"unit": "packet count", "field": "tcpi_lost (Loss Proxy)"},
-            "pacing_rate_bps": {
-                "unit": "bytes/second",
-                "field": "tcpi_pacing_rate",
-            },
-            "bytes_acked": {"unit": "bytes", "field": "tcpi_bytes_acked"},
-        },
-    }
-    json_metadata_path.write_text(json.dumps(metadata, indent=4), encoding="utf-8")
-    print(f"TCP stats metadata documentation written to {json_metadata_path}")
-
-
-
-SUMMARY_COLUMNS = [
-    "destination",
-    "algorithm",
-    "min_Mbps",
-    "median_Mbps",
-    "mean_Mbps",
-    "p95_Mbps",
-]
-
-
-def _percentile(values: list[float], pct: float) -> float:
-    """Return a percentile using linear interpolation between adjacent values."""
-    ordered = sorted(values)
-    if len(ordered) == 1:
-        return ordered[0]
-
-    pos = (pct / 100.0) * (len(ordered) - 1)
-    lo = int(pos)
-    hi = min(lo + 1, len(ordered) - 1)
-    return ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
-
-
-def build_summary_table(results: list[TestResult]):
-    """Build a per-destination table of min / median / mean / p95 goodput (Mbps).
-
-    All samples are included, even zero-goodput ones: stalls are real behavior
-    and should pull the minimum and median down.
-    """
+def build_summary_table(results: list[TestResult]) -> list[dict]:
+    """Min / median / mean / p95 goodput (Mbps) per destination.
+    All samples count, even zero-goodput ones: stalls are real behavior."""
     rows = []
     for r in results:
-        if not r.samples:
-            continue
-        vals = [s.goodput_bps / 1e6 for s in r.samples]      # bits/s -> Mbps
+        mbps = np.array([s.goodput_bps for s in r.samples]) / 1e6
         rows.append({
             "destination": f"{r.host}:{r.port}",
-            "algorithm": r.algorithm,          # read from the data socket (TCP_CONGESTION)
-            "min_Mbps": min(vals),
-            "median_Mbps": statistics.median(vals),
-            "mean_Mbps": statistics.mean(vals),
-            "p95_Mbps": _percentile(vals, 95),
+            "algorithm": r.algorithm,
+            "min_Mbps": mbps.min(),
+            "median_Mbps": np.median(mbps),
+            "mean_Mbps": mbps.mean(),
+            "p95_Mbps": np.percentile(mbps, 95),
         })
     return rows
 
 
-def print_summary_table(rows: list[dict]) -> None:
-    """Print the summary table to the terminal as aligned columns."""
-    if not rows:
-        print("(no samples to summarize)")
-        return
-    fmt = lambda v: f"{v:.6f}" if isinstance(v, float) else str(v)
-    table = [[fmt(row[c]) for c in SUMMARY_COLUMNS] for row in rows]
-    widths = [max([len(h)] + [len(line[i]) for line in table])
-              for i, h in enumerate(SUMMARY_COLUMNS)]
-    print("  ".join(h.rjust(w) for h, w in zip(SUMMARY_COLUMNS, widths)))
-    for line in table:
-        print("  ".join(cell.rjust(w) for cell, w in zip(line, widths)))
-
-
 def write_summary_csv(rows: list[dict], path: Path) -> None:
-    """Save the summary table as a CSV file."""
     with open(path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=SUMMARY_COLUMNS, lineterminator="\n")
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
         writer.writeheader()
         writer.writerows(rows)
 
 
-# ---- 1(c).4  Plot throughput over time ---------------------------------------
 def plot_goodput(results: list[TestResult], out_path: Path) -> None:
-    """Plot goodput over time, one panel per destination, saved to out_path."""
-    import matplotlib
-    matplotlib.use("Agg")  # non-interactive backend: works headless in Docker
-    import matplotlib.pyplot as plt
-
-    n = len(results)
-    if n == 0:
-        print("No successful results to plot.")
-        return
-
-    # One row of panels per destination; squeeze=False keeps axes 2-D even for n=1.
-    fig, axes = plt.subplots(n, 1, figsize=(8, 3 * n), squeeze=False)
+    """Goodput over time, one panel per destination."""
+    fig, axes = plt.subplots(len(results), 1, figsize=(8, 3 * len(results)), squeeze=False)
     for ax, r in zip(axes[:, 0], results):
-        xs = [s.elapsed_s for s in r.samples]
-        ys = [s.goodput_bps / 1e6 for s in r.samples]   # convert to Mbps for readability
-        ax.plot(xs, ys, marker="o", markersize=2)
-        ax.set_title(f"{r.host}:{r.port}")
+        ax.plot([s.elapsed_s for s in r.samples],
+                [s.goodput_bps / 1e6 for s in r.samples], marker="o", markersize=2)
+        ax.set_title(f"{r.host}:{r.port} ({r.algorithm})")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Goodput (Mbps)")
         ax.grid(True, alpha=0.3)
-
     fig.tight_layout()
     fig.savefig(out_path)
     plt.close(fig)
     print(f"Saved plot: {out_path}")
 
 
-# ##############################################################################
-# DOCKER LAUNCHER (convenience only; not part of the assignment logic)
-# ##############################################################################
-IMAGE_NAME = "cs422-assignment2"
-
-
-def launch_in_docker(argv: list[str]) -> int:
-    """Run this same script inside Docker and return its exit code.
-
-    Called when main.py is started on the host. It builds the image, then runs
-    a container with the same command-line arguments. The project folder is
-    mounted at /app so output files appear on the host, and the container runs
-    as the current user so those files aren't owned by root.
-    """
-    here = Path(__file__).resolve().parent
-    print(f"[launcher] Building Docker image '{IMAGE_NAME}' ...")
-    build = subprocess.run(["docker", "build", "-t", IMAGE_NAME, str(here)])
-    if build.returncode != 0:
-        print("[launcher] docker build failed.")
-        return build.returncode
-
-    print("[launcher] Running experiment in container ...")
-    cmd = [
-        "docker", "run", "--rm",
-        "--user", f"{os.getuid()}:{os.getgid()}",   # keep output files owned by you
-        "-e", "MPLCONFIGDIR=/tmp",                  # matplotlib needs a writable config dir
-        "-v", f"{here}:/app",                       # share project folder with the container
-        IMAGE_NAME,
-    ] + argv
-    return subprocess.run(cmd).returncode
-
-
-# ##############################################################################
-# ENTRY POINT
-# ##############################################################################
+# ==============================================================================
+# Entry point
+# ==============================================================================
 def main():
-    """Parse arguments, run the experiment, and write all outputs."""
-    parser = argparse.ArgumentParser(description="CS 422 Assignment 2, Part 1")
+    parser = argparse.ArgumentParser(description="CS 422 Assignment 2, Parts 1 and 2(a)")
     parser.add_argument("--n", type=int, default=N_DESTINATIONS,
                         help="number of destination servers to test (default: 10)")
     parser.add_argument("--duration", type=float, default=DURATION,
                         help="seconds to send data for per destination")
     parser.add_argument("--max-extra-attempts", type=int, default=MAX_REPLACEMENT_ATTEMPTS,
                         help="bounded extra attempts to replace failed destinations")
-    parser.add_argument("--no-docker", action="store_true",
-                        help="run directly on this machine instead of inside Docker")
     args = parser.parse_args()
-
-    # On the host, hand off to Docker. Inside the container IN_DOCKER=1 is set
-    # by the Dockerfile, so the experiment runs for real.
-    if os.environ.get("IN_DOCKER") != "1" and not args.no_docker:
-        forwarded = [a for a in sys.argv[1:] if a != "--no-docker"]
-        sys.exit(launch_in_docker(forwarded))
 
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    # ---- Part 1(a) + 1(b): pick destinations and run the iperf3 test on each ----
+    # 1(a) + 1(b): pick destinations and run the iperf3 test on each
     results, log_lines = select_destinations(args.n, args.duration, args.max_extra_attempts)
-
-    # ---- Part 1(b): record the servers tried, with pass/fail and any shortfall ----
-    log_path = RESULTS_DIR / "destination_log.txt"
-    log_path.write_text("\n".join(log_lines) + "\n")
-    print(f"Destination log written to {log_path}")
+    (RESULTS_DIR / "destination_log.txt").write_text("\n".join(log_lines) + "\n")
 
     if not results:
         print("No successful destinations -- nothing to plot or summarize.")
         sys.exit(1)
 
-    # ---- Part 1(c): save every raw goodput sample ("compute and record") ----
-    samples_path = RESULTS_DIR / "goodput_samples.csv"
-    with open(samples_path, "w", newline="") as f:
-        writer = csv.writer(f, lineterminator="\n")
-        writer.writerow(["destination", "elapsed_s", "bytes_acked", "goodput_bps"])
-        for r in results:
-            for s in r.samples:
-                writer.writerow([f"{r.host}:{r.port}", f"{s.elapsed_s:.3f}",
-                                 s.bytes_acked, f"{s.goodput_bps:.1f}"])
-    print(f"Raw samples written to {samples_path}")
+    # 1(c) + 2(a): every sample, with goodput and TCP stats side by side
+    write_trace_csv(results, RESULTS_DIR / "tcp_stats_trace.csv")
 
-    save_tcp_stats_export(
-        results,
-        RESULTS_DIR / "tcp_stats_trace.csv",
-        RESULTS_DIR / "tcp_stats_metadata.json",
-    )
-    # 1(c): summary table (min / median / mean / p95 per destination).
-    summary_rows = build_summary_table(results)
+    # 1(c): summary table
+    rows = build_summary_table(results)
+    write_summary_csv(rows, RESULTS_DIR / "summary_table.csv")
     print("\nSummary (Mbps):")
-    print_summary_table(summary_rows)
-    summary_path = RESULTS_DIR / "summary_table.csv"
-    write_summary_csv(summary_rows, summary_path)
-    print(f"Summary table written to {summary_path}")
+    for row in rows:
+        print(f"  {row['destination']:<30} {row['algorithm']:<8} "
+              f"min={row['min_Mbps']:.2f}  median={row['median_Mbps']:.2f}  "
+              f"mean={row['mean_Mbps']:.2f}  p95={row['p95_Mbps']:.2f}")
 
-    # ---- Part 1(c): goodput-versus-time plot, one panel per destination ----
+    # 1(c): goodput-versus-time plot
     plot_goodput(results, RESULTS_DIR / "goodput_plot.png")
 
 
