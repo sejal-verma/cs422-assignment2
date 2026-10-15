@@ -1,12 +1,12 @@
 """CS 422 Assignment 2 -- Parts 1 & 2(a): iperf3 client + TCP statistics trace.
 
-Run:   python3 main_simplified.py --n 10 --duration 10
+Run:   python3 main.py --n 10 --duration 10
 Needs: Linux (for TCP_INFO), matplotlib, numpy.
 
 Outputs: destination_log.txt, tcp_stats_trace.csv, summary_table.csv, goodput_plot.png, representative_tcp_time_series.pdf, representative_tcp_scatter.pdf
 
 
-How the numbers are computed (copy into the report):
+How the numbers are computed:
   decoding   : getsockopt(IPPROTO_TCP, TCP_INFO) on the DATA socket, decoded with a
                ctypes mirror of Linux `struct tcp_info` (fields in kernel order).
   goodput    : (bytes_acked_now - bytes_acked_prev) * 8 / (t_now - t_prev)   [bits/s]
