@@ -3,6 +3,8 @@ destination_log.txt
 goodput_samples.csv
 summary_table.csv
 goodput_plot.png
+representative_tcp_time_series.pdf
+representative_tcp_scatter.pdf
 tcp_stats_trace.csv
 tcp_stats_metadata.json
 venv/

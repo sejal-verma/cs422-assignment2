@@ -3,7 +3,8 @@
 Run:   python3 main_simplified.py --n 10 --duration 10
 Needs: Linux (for TCP_INFO), matplotlib, numpy.
 
-Outputs: destination_log.txt, tcp_stats_trace.csv, summary_table.csv, goodput_plot.png
+Outputs: destination_log.txt, tcp_stats_trace.csv, summary_table.csv, goodput_plot.png, representative_tcp_time_series.pdf, representative_tcp_scatter.pdf
+
 
 How the numbers are computed (copy into the report):
   decoding   : getsockopt(IPPROTO_TCP, TCP_INFO) on the DATA socket, decoded with a
@@ -512,6 +513,72 @@ def plot_goodput(results: list[TestResult], out_path: Path) -> None:
     plt.close(fig)
     print(f"Saved plot: {out_path}")
 
+def generate_representative_plots(results: list[TestResult], out_dir: Path) -> None:
+    """Write PDF time-series and relationship plots for a representative run.
+
+    The representative destination is the successful run whose mean goodput is
+    closest to the median mean goodput across all successful destinations.
+    The congestion-control algorithm is only observed from TCP_CONGESTION; this
+    method does not change the kernel's default algorithm.
+    """
+    representative = min(
+        results,
+        key=lambda result: abs(
+            np.mean([sample.goodput_bps for sample in result.samples])
+            - np.median([
+                np.mean([sample.goodput_bps for sample in candidate.samples])
+                for candidate in results
+            ])
+        ),
+    )
+    samples = representative.samples
+    title = (f"Representative destination: {representative.host}:{representative.port} "
+             f"({representative.algorithm})")
+
+    elapsed = [sample.elapsed_s for sample in samples]
+    goodput_mbps = [sample.goodput_bps / 1e6 for sample in samples]
+    cwnd = [sample.snd_cwnd for sample in samples]
+    rtt_ms = [sample.rtt_us / 1e3 for sample in samples]
+    loss_signal = [sample.new_retrans for sample in samples]
+
+    fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
+    time_series = [
+        (cwnd, "snd_cwnd (segments)"),
+        (rtt_ms, "RTT (ms)"),
+        (loss_signal, "Loss proxy: new retransmissions (segments/interval)"),
+        (goodput_mbps, "Throughput / goodput (Mbps)"),
+    ]
+    for ax, (values, ylabel) in zip(axes, time_series):
+        ax.plot(elapsed, values, marker="o", markersize=2, linewidth=1)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("Time (s)")
+    fig.suptitle(title)
+    fig.tight_layout()
+    time_series_path = out_dir / "representative_tcp_time_series.pdf"
+    fig.savefig(time_series_path)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    scatter_data = [
+        (cwnd, "snd cwnd (segments)", "snd cwnd vs goodput"),
+        (rtt_ms, "RTT (ms)", "RTT vs goodput"),
+        (loss_signal, "New retransmissions (segments/interval)",
+         "Loss signal vs goodput"),
+    ]
+    for ax, (values, xlabel, plot_title) in zip(axes, scatter_data):
+        ax.scatter(values, goodput_mbps, alpha=0.75)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Goodput (Mbps)")
+        ax.set_title(plot_title)
+        ax.grid(True, alpha=0.3)
+    fig.suptitle(title)
+    fig.tight_layout()
+    scatter_path = out_dir / "representative_tcp_scatter.pdf"
+    fig.savefig(scatter_path)
+    plt.close(fig)
+
+    print(f"Saved representative plots: {time_series_path}, {scatter_path}")
 
 # ==============================================================================
 # Entry point
@@ -558,6 +625,8 @@ def main():
     # 1(c): goodput-versus-time plot
     plot_goodput(results, RESULTS_DIR / "goodput_plot.png")
 
+    # 2(b): representative TCP time-series and relationship plots
+    generate_representative_plots(results, RESULTS_DIR)
 
 if __name__ == "__main__":
     main()

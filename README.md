@@ -66,6 +66,12 @@ Written to the project folder:
 | `goodput_samples.csv` | Raw samples: destination, elapsed seconds, cumulative bytes acked, goodput (bits/s) |
 | `summary_table.csv` | Per-destination min / median / mean / p95 goodput in Mbps, with the congestion-control algorithm actually in use (read from the data socket via `TCP_CONGESTION`) |
 | `goodput_plot.png` | Goodput over time, one panel per destination |
+| `representative_tcp_time_series.pdf` | Time series of snd cwnd, RTT, retransmission loss proxy, and goodput for the representative destination |
+| `representative_tcp_scatter.pdf` | Scatter plots of snd cwnd, RTT, and retransmission loss proxy versus goodput for the same destination |
+
+The representative destination is the successful run whose mean goodput is closest to the median
+mean goodput across successful destinations. The plots observe the congestion-control algorithm
+selected by the Linux kernel (typically CUBIC by default); they do not force a different algorithm.
 
 ## How goodput is computed
 
