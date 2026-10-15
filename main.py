@@ -458,6 +458,48 @@ def select_destinations(n: int, duration: float, max_extra_attempts: int, algori
     return results, log_lines
 
 
+def run_fixed_destination(host: str, port: int, duration: float,
+                          algorithm: str, repetitions: int):
+    results, log_lines = [], []
+
+    for repetition in range(1, repetitions + 1):
+        print(f"[{repetition}/{repetitions}] Testing {host}:{port} "
+              f"with {algorithm} ...")
+
+        sampler = TCPStatsSampler()
+        client = Iperf3Client(
+            host,
+            port,
+            duration=duration,
+            on_sample=sampler.on_sample,
+            algorithm=algorithm
+        )
+
+        result = client.run()
+        result.samples = sampler.samples
+        result.run_id = f"{algorithm}_run_{repetition}"
+
+        if result.success and not result.samples:
+            result.success = False
+            result.error = "no TCP_INFO samples recorded"
+
+        if result.success:
+            print(f"  OK  ({result.bytes_sent} bytes sent)")
+            log_lines.append(
+                f"OK    {host}:{port}  algorithm={result.algorithm}  "
+                f"run={repetition}"
+            )
+            results.append(result)
+        else:
+            print(f"  FAIL: {result.error}")
+            log_lines.append(
+                f"FAIL  {host}:{port}  algorithm={algorithm}  "
+                f"run={repetition}  error={result.error}"
+            )
+
+    return results, log_lines
+
+
 # ==============================================================================
 # Outputs: trace CSV, summary table, plot
 # ==============================================================================
@@ -481,6 +523,7 @@ def build_summary_table(results: list[TestResult]) -> list[dict]:
         mbps = np.array([s.goodput_bps for s in r.samples]) / 1e6
         rows.append({
             "destination": f"{r.host}:{r.port}",
+            "run_id": r.run_id,
             "algorithm": r.algorithm,
             "min_Mbps": mbps.min(),
             "median_Mbps": np.median(mbps),
@@ -526,29 +569,57 @@ def main():
                         help="bounded extra attempts to replace failed destinations")
     parser.add_argument("--algorithm", choices=["cubic", "reno", "bbr"], default="cubic",
                         help="TCP congestion-control algorithm: cubic, reno, or bbr")
+    parser.add_argument("--host",
+                        help="fixed destination host for repeated tests")
+    parser.add_argument("--port", type=int,
+                        help="fixed destination port for repeated tests")
+    parser.add_argument("--repetitions", type=int, default=1,
+                        help="number of repetitions for a fixed destination")
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(exist_ok=True)
 
     # 1(a) + 1(b): pick destinations and run the iperf3 test on each
-    results, log_lines = select_destinations(
-        args.n,
-        args.duration,
-        args.max_extra_attempts,
-        args.algorithm
+    if args.host:
+        if args.port is None:
+            parser.error("--port is required when --host is provided")
+
+        results, log_lines = run_fixed_destination(
+            args.host,
+            args.port,
+            args.duration,
+            args.algorithm,
+            args.repetitions
+        )
+    else:
+        results, log_lines = select_destinations(
+            args.n,
+            args.duration,
+            args.max_extra_attempts,
+            args.algorithm
+        )
+
+    output_prefix = args.algorithm
+    (RESULTS_DIR / f"{output_prefix}_destination_log.txt").write_text(
+        "\n".join(log_lines) + "\n"
     )
-    (RESULTS_DIR / "destination_log.txt").write_text("\n".join(log_lines) + "\n")
 
     if not results:
         print("No successful destinations -- nothing to plot or summarize.")
         sys.exit(1)
 
     # 1(c) + 2(a): every sample, with goodput and TCP stats side by side
-    write_trace_csv(results, RESULTS_DIR / "tcp_stats_trace.csv")
+    write_trace_csv(
+        results,
+        RESULTS_DIR / f"{output_prefix}_tcp_stats_trace.csv"
+    )
 
     # 1(c): summary table
     rows = build_summary_table(results)
-    write_summary_csv(rows, RESULTS_DIR / "summary_table.csv")
+    write_summary_csv(
+        rows,
+        RESULTS_DIR / f"{output_prefix}_summary_table.csv"
+    )
     print("\nSummary (Mbps):")
     for row in rows:
         print(f"  {row['destination']:<30} {row['algorithm']:<8} "
@@ -556,7 +627,10 @@ def main():
               f"mean={row['mean_Mbps']:.2f}  p95={row['p95_Mbps']:.2f}")
 
     # 1(c): goodput-versus-time plot
-    plot_goodput(results, RESULTS_DIR / "goodput_plot.png")
+    plot_goodput(
+        results,
+        RESULTS_DIR / f"{output_prefix}_goodput_plot.png"
+    )
 
 
 if __name__ == "__main__":
