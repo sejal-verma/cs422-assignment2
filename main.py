@@ -122,6 +122,22 @@ def get_congestion_algorithm(sock: socket.socket) -> str:
         return "unknown"
 
 
+#part 3a
+def set_congestion_algorithm(sock: socket.socket, algorithm: str) -> None:
+    """Set the TCP congestion-control algorithm for this socket."""
+
+    if algorithm not in ("cubic", "reno", "bbr"):
+        raise ValueError(f"Unsupported congestion-control algorithm: {algorithm}")
+
+    opt = getattr(socket, "TCP_CONGESTION", 13)
+
+    sock.setsockopt(
+        socket.IPPROTO_TCP,
+        opt,
+        algorithm.encode("ascii")
+    )
+
+
 # ==============================================================================
 # iperf3 protocol helpers (Part 1(a))
 # ==============================================================================
@@ -233,12 +249,14 @@ class Iperf3Client:
 
     def __init__(self, host: str, port: int, duration: float = 10.0,
                  blksize: int = DEFAULT_BLKSIZE,
-                 on_sample: Optional[Callable[[socket.socket, float, int], None]] = None):
+                 on_sample: Optional[Callable[[socket.socket, float, int], None]] = None,
+                 algorithm: str = "cubic"):
         self.host = host
         self.port = port
         self.duration = duration
         self.blksize = blksize
         self.on_sample = on_sample        # called every SAMPLE_INTERVAL with (data_sock, elapsed, bytes_sent)
+        self.algorithm = algorithm
         self.cookie = make_cookie()
         self.ctrl_sock: Optional[socket.socket] = None
         self.data_sock: Optional[socket.socket] = None
@@ -254,7 +272,11 @@ class Iperf3Client:
 
     def _open_data_stream(self) -> None:
         """Step (iii): data connection + the same cookie."""
-        sock = socket.create_connection((self._peer_ip, self.port), timeout=CONNECT_TIMEOUT)
+        family = self.ctrl_sock.family
+        sock = socket.socket(family, socket.SOCK_STREAM)
+        sock.settimeout(CONNECT_TIMEOUT)
+        set_congestion_algorithm(sock, self.algorithm)
+        sock.connect((self._peer_ip, self.port))
         sock.settimeout(IO_TIMEOUT)
         sock.sendall(self.cookie)
         self.data_sock = sock
@@ -384,7 +406,7 @@ def fetch_server_pool() -> list[tuple[str, int]]:
     return pool
 
 
-def select_destinations(n: int, duration: float, max_extra_attempts: int):
+def select_destinations(n: int, duration: float, max_extra_attempts: int, algorithm: str):
     """Test random servers until n succeed or n + max_extra_attempts are used.
     Returns (successful TestResults, log lines)."""
     print(f"Fetching server pool from {SERVER_LIST_URL} ...")
@@ -403,7 +425,13 @@ def select_destinations(n: int, duration: float, max_extra_attempts: int):
         print(f"[{attempts}/{max_attempts}] Testing {host}:{port} ...")
 
         sampler = TCPStatsSampler()          # fresh sampler keeps servers separate
-        client = Iperf3Client(host, port, duration=duration, on_sample=sampler.on_sample)
+        client = Iperf3Client(
+            host,
+            port,
+            duration=duration,
+            on_sample=sampler.on_sample,
+            algorithm=algorithm
+        )
         result = client.run()
         result.samples = sampler.samples
         result.run_id = f"run_{attempts}"
@@ -496,12 +524,19 @@ def main():
                         help="seconds to send data for per destination")
     parser.add_argument("--max-extra-attempts", type=int, default=MAX_REPLACEMENT_ATTEMPTS,
                         help="bounded extra attempts to replace failed destinations")
+    parser.add_argument("--algorithm", choices=["cubic", "reno", "bbr"], default="cubic",
+                        help="TCP congestion-control algorithm: cubic, reno, or bbr")
     args = parser.parse_args()
 
     RESULTS_DIR.mkdir(exist_ok=True)
 
     # 1(a) + 1(b): pick destinations and run the iperf3 test on each
-    results, log_lines = select_destinations(args.n, args.duration, args.max_extra_attempts)
+    results, log_lines = select_destinations(
+        args.n,
+        args.duration,
+        args.max_extra_attempts,
+        args.algorithm
+    )
     (RESULTS_DIR / "destination_log.txt").write_text("\n".join(log_lines) + "\n")
 
     if not results:
