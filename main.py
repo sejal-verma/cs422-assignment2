@@ -1,6 +1,7 @@
 """CS 422 Assignment 2 -- Parts 1 & 2(a): iperf3 client + TCP statistics trace.
 
-Run:   python3 main.py --n 10 --duration 10
+Run:   python main.py [OR] python main.py --n ... --duration ... --max-extra-attempts ... --algorithm ... --host ... --port ... --repetitions ...
+
 Needs: Linux (for TCP_INFO), matplotlib, numpy.
 
 Outputs: destination_log.txt, tcp_stats_trace.csv, summary_table.csv, goodput_plot.png, representative_tcp_time_series.pdf, representative_tcp_scatter.pdf
@@ -636,9 +637,9 @@ def main():
                         help="bounded extra attempts to replace failed destinations")
     parser.add_argument("--algorithm", choices=["cubic", "reno", "bbr"], default="cubic",
                         help="TCP congestion-control algorithm: cubic, reno, or bbr")
-    parser.add_argument("--host",
+    parser.add_argument("--host", default="speedtest.lagoon.nc",
                         help="fixed destination host for repeated tests")
-    parser.add_argument("--port", type=int,
+    parser.add_argument("--port", type=int, default="5202",
                         help="fixed destination port for repeated tests")
     parser.add_argument("--repetitions", type=int, default=1,
                         help="number of repetitions for a fixed destination")
