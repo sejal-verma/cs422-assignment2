@@ -584,7 +584,11 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
     cwnd = [sample.snd_cwnd for sample in samples]
     rtt_ms = [sample.rtt_us / 1e3 for sample in samples]
     loss_signal = [sample.new_retrans for sample in samples]
-
+    # Same axis scales for CUBIC, Reno, and BBR comparisons
+    CWND_MAX = 5000
+    RTT_MAX = 400
+    LOSS_MAX = 300
+    GOODPUT_MAX = 110
     fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
     time_series = [
         (cwnd, "snd_cwnd (segments)"),
@@ -596,10 +600,14 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
         ax.plot(elapsed, values, marker="o", markersize=2, linewidth=1)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
+    axes[0].set_ylim(0, CWND_MAX)
+    axes[1].set_ylim(0, RTT_MAX)
+    axes[2].set_ylim(0, LOSS_MAX)
+    axes[3].set_ylim(0, GOODPUT_MAX)
     axes[-1].set_xlabel("Time (s)")
     fig.suptitle(title)
     fig.tight_layout()
-    time_series_path = out_dir / "representative_tcp_time_series.pdf"
+    time_series_path = out_dir / f"{representative.algorithm}_representative_tcp_time_series.pdf"
     fig.savefig(time_series_path)
     plt.close(fig)
 
@@ -616,9 +624,16 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
         ax.set_ylabel("Goodput (Mbps)")
         ax.set_title(plot_title)
         ax.grid(True, alpha=0.3)
+    # Same x-axis scales for each metric
+    axes[0].set_xlim(0, CWND_MAX)
+    axes[1].set_xlim(0, RTT_MAX)
+    axes[2].set_xlim(0, LOSS_MAX)
+    # Same goodput scale on all scatter plots
+    for ax in axes:
+        ax.set_ylim(0, GOODPUT_MAX)
     fig.suptitle(title)
     fig.tight_layout()
-    scatter_path = out_dir / "representative_tcp_scatter.pdf"
+    scatter_path = out_dir / f"{representative.algorithm}_representative_tcp_scatter.pdf"
     fig.savefig(scatter_path)
     plt.close(fig)
 
