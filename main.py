@@ -585,10 +585,10 @@ def generate_representative_plots(results: list[TestResult], out_dir: Path) -> N
     rtt_ms = [sample.rtt_us / 1e3 for sample in samples]
     loss_signal = [sample.new_retrans for sample in samples]
     # Same axis scales for CUBIC, Reno, and BBR comparisons
-    CWND_MAX = 5000
-    RTT_MAX = 400
-    LOSS_MAX = 300
-    GOODPUT_MAX = 110
+    CWND_MAX = 12000
+    RTT_MAX = 800
+    LOSS_MAX = 1000
+    GOODPUT_MAX = 120
     fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
     time_series = [
         (cwnd, "snd_cwnd (segments)"),
